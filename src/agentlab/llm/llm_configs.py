@@ -21,6 +21,14 @@ CLOSED_SOURCE_APIS = [
 ]
 
 CHAT_MODEL_ARGS_DICT = {
+    "openai/gpt-5.4-2026-03-05": OpenAIModelArgs(
+        model_name="gpt-5.4-2026-03-05",
+        max_total_tokens=400_000,
+        max_input_tokens=256_000,
+        max_new_tokens=128_000,
+        temperature=1,
+        vision_support=True,
+    ),
     "openai/gpt-5-2025-08-07": OpenAIModelArgs(
         model_name="gpt-5-2025-08-07",
         max_total_tokens=400_000,
