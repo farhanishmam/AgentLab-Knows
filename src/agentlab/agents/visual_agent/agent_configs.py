@@ -2,6 +2,7 @@ import bgym
 from bgym import HighLevelActionSetArgs
 
 import agentlab.agents.dynamic_prompting as dp
+from agentlab.agents.generic_agent.tmlr_config import SIGN_IN_INSTRUCTIONS
 from agentlab.llm.llm_configs import CHAT_MODEL_ARGS_DICT
 
 from .visual_agent import VisualAgentArgs
@@ -31,7 +32,7 @@ DEFAULT_PROMPT_FLAGS = PromptFlags(
     use_concrete_example=False,
     use_abstract_example=True,
     enable_chat=False,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
 VISUAL_AGENT_4o = VisualAgentArgs(

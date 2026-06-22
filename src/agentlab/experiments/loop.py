@@ -1,5 +1,6 @@
 import gzip
 import importlib.metadata
+import inspect
 import json
 import logging
 import os
@@ -32,6 +33,12 @@ except ImportError:
 
 
 logger = logging.getLogger(__name__)
+
+
+def _debug_progress(message: str) -> None:
+    if os.environ.get("AGENTLAB_DEBUG_PROGRESS", "").strip():
+        print(f"[agentlab-progress] {message}", flush=True)
+
 
 SEED_MAX = 2 ^ 32  # arbitrary max value (exclusive), seems large enough
 
@@ -414,11 +421,13 @@ class ExpArgs:
         env, step_info, err_msg, stack_trace = None, None, None, None
         try:
             logger.info(f"Running experiment {self.exp_name} in:\n  {self.exp_dir}")
+            _debug_progress(f"{self.exp_name}: creating agent")
             agent = self.agent_args.make_agent()
             if hasattr(agent, "set_task_name"):
                 agent.set_task_name(self.env_args.task_name)
 
             logger.debug("Agent created.")
+            _debug_progress(f"{self.exp_name}: creating environment")
 
             env = self.env_args.make_env(
                 action_mapping=agent.action_set.to_python_code,
@@ -427,17 +436,21 @@ class ExpArgs:
             )
 
             logger.debug("Environment created.")
+            _debug_progress(f"{self.exp_name}: resetting environment")
             step_info = StepInfo(step=0)
             episode_info = [step_info]
             step_info.from_reset(
                 env, seed=self.env_args.task_seed or 0, obs_preprocessor=agent.obs_preprocessor
             )
             logger.debug("Environment reset.")
+            _debug_progress(f"{self.exp_name}: environment reset complete")
 
             while not step_info.is_done:  # set a limit
                 logger.debug(f"Starting step {step_info.step}.")
+                _debug_progress(f"{self.exp_name}: requesting action for step {step_info.step}")
                 action = step_info.from_action(agent)
                 logger.debug(f"Agent chose action:\n {action}")
+                _debug_progress(f"{self.exp_name}: received action for step {step_info.step}")
 
                 if action is None:
                     # will end the episode after saving the step info.
@@ -487,6 +500,14 @@ class ExpArgs:
                     )
             except Exception as e:
                 logger.error(f"Error while saving step info in the finally block: {e}")
+            # Give the task a chance to grade the final state once the episode
+            # has ended through ANY pathway (DONE, infeasible, truncation,
+            # empty-action, or error). Tasks that don't expose a finalize()
+            # method are silently skipped, preserving backwards compatibility.
+            try:
+                _maybe_finalize_task(env, episode_info, exp_dir=Path(self.exp_dir))
+            except Exception as e:
+                logger.exception(f"Error while finalizing the task: {e}")
             try:
                 if (
                     not err_msg
@@ -577,8 +598,91 @@ class ExpArgs:
             summary_info["terminated"] = episode_info[-1].terminated
             summary_info["truncated"] = episode_info[-1].truncated
 
+            # Persist task-side info from the final step's validate() call.
+            # Two outputs are produced:
+            #   1. <exp_dir>/task_info.json — full structured payload (per-
+            #      checkpoint scores, per-step pass/fail, evaluation report,
+            #      etc.) for richer offline inspection.
+            #   2. summary_info.json gets every *scalar* top-level entry
+            #      from task_info merged in. Scalars become columns in
+            #      result_df_*.csv automatically (via ExpResult.get_exp_record),
+            #      which is how per-checkpoint scores end up alongside
+            #      cum_reward in the study-level dataframe.
+            last_task_info = getattr(episode_info[-1], "task_info", None)
+            if isinstance(last_task_info, dict):
+                try:
+                    with open(exp_dir / "task_info.json", "w") as f:
+                        json.dump(last_task_info, f, indent=4, default=str)
+                except Exception as e:
+                    logger.warning(f"Failed to write task_info.json: {e}")
+                for k, v in last_task_info.items():
+                    if isinstance(v, (int, float, str, bool)) or v is None:
+                        summary_info[k] = v
+
         with open(exp_dir / "summary_info.json", "w") as f:
             json.dump(summary_info, f, indent=4)
+
+
+def _maybe_finalize_task(env, episode_info: list["StepInfo"], exp_dir: Path | None = None):
+    """Run ``task.finalize(page[, exp_dir])`` if the task supports it.
+
+    Used so KNOWS-style tasks always grade their final document state — even
+    when the episode ended via truncation, infeasible-report, or an empty
+    agent action — and so the per-checkpoint scores plus aggregated reward
+    end up in ``summary_info.json``.
+
+    The score breakdown returned by ``finalize()`` is merged into the LAST
+    StepInfo's ``task_info`` so :py:meth:`ExpArgs.save_summary_info` picks
+    up every scalar key (``eval.cp1_*``, ``eval.score_*``, …) automatically.
+    The aggregated reward replaces the final step's ``reward`` (which in turn
+    becomes ``cum_reward`` since earlier steps' rewards are 0 for these
+    end-of-episode-only tasks).
+
+    ``exp_dir`` is forwarded to ``finalize()`` only when its signature
+    declares the kwarg, so older tasks that only accept ``page`` keep
+    working unchanged. KNOWS tasks use it to write a per-trial
+    ``eval.log`` next to ``experiment.log``.
+    """
+    if env is None or len(episode_info) == 0:
+        return
+
+    task = getattr(getattr(env, "unwrapped", env), "task", None)
+    finalize = getattr(task, "finalize", None)
+    if not callable(finalize):
+        return
+
+    page = getattr(getattr(env, "unwrapped", env), "page", None)
+    finalize_kwargs = {}
+    if exp_dir is not None:
+        try:
+            sig_params = inspect.signature(finalize).parameters
+        except (TypeError, ValueError):
+            sig_params = {}
+        if "exp_dir" in sig_params or any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+        ):
+            finalize_kwargs["exp_dir"] = exp_dir
+    try:
+        extra = finalize(page, **finalize_kwargs)
+    except Exception as e:
+        logger.warning(f"task.finalize() raised: {e}")
+        return
+
+    if not isinstance(extra, dict) or not extra:
+        return
+
+    last_step = episode_info[-1]
+    if last_step.task_info is None:
+        last_step.task_info = {}
+    last_step.task_info.update(extra)
+
+    # If finalize() produced an aggregated reward, override the last step's
+    # reward so cum_reward in summary_info.json reflects the graded score.
+    override = extra.get("cum_reward_override")
+    if override is None:
+        override = extra.get("eval.score_fraction")
+    if isinstance(override, (int, float)):
+        last_step.reward = float(override)
 
 
 def _extract_err_msg(episode_info: list[StepInfo]):

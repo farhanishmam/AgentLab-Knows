@@ -1,8 +1,11 @@
 import logging
 import os
+import queue
 import re
+import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from functools import partial
 from typing import Optional
 
@@ -84,6 +87,58 @@ class OpenRouterModelArgs(BaseModelArgs):
     def make_model(self):
         return OpenRouterChatModel(
             model_name=self.model_name,
+            temperature=self.temperature,
+            max_tokens=self.max_new_tokens,
+            log_probs=self.log_probs,
+        )
+
+
+@dataclass
+class GoogleModelArgs(BaseModelArgs):
+    """Serializable object for instantiating a Gemini chat model via Google's
+    OpenAI-compatible endpoint."""
+
+    def make_model(self):
+        return GoogleChatModel(
+            model_name=self.model_name,
+            temperature=self.temperature,
+            max_tokens=self.max_new_tokens,
+            log_probs=self.log_probs,
+        )
+
+
+@dataclass
+class DeepSeekModelArgs(BaseModelArgs):
+    """Serializable object for instantiating a DeepSeek chat model via the
+    official DeepSeek OpenAI-compatible endpoint (``api.deepseek.com``)."""
+
+    def make_model(self):
+        return DeepSeekChatModel(
+            model_name=self.model_name,
+            temperature=self.temperature,
+            max_tokens=self.max_new_tokens,
+            log_probs=self.log_probs,
+        )
+
+
+@dataclass
+class VertexAIGeminiModelArgs(BaseModelArgs):
+    """Serializable object for instantiating Gemini via Vertex AI."""
+
+    project_id: Optional[str] = None
+    location: Optional[str] = None
+    base_url: Optional[str] = None
+
+    def make_model(self):
+        if self.model_name.startswith("google/"):
+            vertex_model_name = self.model_name
+        else:
+            vertex_model_name = f"google/{self.model_name}"
+        return VertexAIGeminiChatModel(
+            model_name=vertex_model_name,
+            project_id=self.project_id,
+            location=self.location,
+            base_url=self.base_url,
             temperature=self.temperature,
             max_tokens=self.max_new_tokens,
             log_probs=self.log_probs,
@@ -239,6 +294,7 @@ class ChatModel(AbstractChatModel):
         client_args=None,
         pricing_func=None,
         log_probs=False,
+        completion_token_param="max_completion_tokens",
     ):
         assert max_retry > 0, "max_retry should be greater than 0"
 
@@ -248,6 +304,7 @@ class ChatModel(AbstractChatModel):
         self.max_retry = max_retry
         self.min_retry_wait_time = min_retry_wait_time
         self.log_probs = log_probs
+        self.completion_token_param = completion_token_param
 
         # Get the API key from the environment variable if not provided
         if api_key_env_var:
@@ -288,14 +345,19 @@ class ChatModel(AbstractChatModel):
             self.retries += 1
             temperature = temperature if temperature is not None else self.temperature
             try:
-                completion = self.client.chat.completions.create(
+                # Only forward `logprobs` when explicitly enabled. Some
+                # OpenAI-compatible endpoints (e.g. Gemini's) reject the
+                # field outright, even when it is set to False.
+                create_kwargs = dict(
                     model=self.model_name,
                     messages=messages,
                     n=n_samples,
                     temperature=temperature,
-                    max_completion_tokens=self.max_tokens,
-                    logprobs=self.log_probs,
                 )
+                create_kwargs[self.completion_token_param] = self.max_tokens
+                if self.log_probs:
+                    create_kwargs["logprobs"] = self.log_probs
+                completion = self.client.chat.completions.create(**create_kwargs)
 
                 if completion.usage is None:
                     raise OpenRouterError(
@@ -392,6 +454,218 @@ class OpenRouterChatModel(ChatModel):
             pricing_func=tracking.get_pricing_openrouter,
             log_probs=log_probs,
         )
+
+
+class GoogleChatModel(ChatModel):
+    """Chat model for Google Gemini via the official OpenAI-compatible endpoint.
+
+    Authenticates with `GEMINI_API_KEY` (preferred) and falls back to
+    `GOOGLE_API_KEY` for compatibility with `google-generativeai` setups.
+    """
+
+    def __init__(
+        self,
+        model_name,
+        api_key=None,
+        temperature=0.5,
+        max_tokens=100,
+        max_retry=4,
+        min_retry_wait_time=60,
+        log_probs=False,
+    ):
+        api_key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        assert api_key, (
+            "GEMINI_API_KEY (or GOOGLE_API_KEY) must be set in the environment "
+            "when using GoogleChatModel."
+        )
+        client_args = {
+            "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        }
+        super().__init__(
+            model_name=model_name,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retry=max_retry,
+            min_retry_wait_time=min_retry_wait_time,
+            client_class=OpenAI,
+            client_args=client_args,
+            pricing_func=partial(tracking.get_pricing_litellm, model_name=model_name),
+            log_probs=log_probs,
+            completion_token_param="max_tokens",
+        )
+
+
+class DeepSeekChatModel(ChatModel):
+    """Chat model for DeepSeek via the official OpenAI-compatible endpoint.
+
+    Authenticates with ``DEEPSEEK_API_KEY``. The endpoint
+    ``https://api.deepseek.com/v1`` accepts the same request/response shape
+    as the OpenAI Chat Completions API, so we reuse the standard
+    ``OpenAI`` client pointed at it.
+
+    Image content blocks (OpenAI-style ``image_url``) are forwarded
+    untouched. Whether the upstream model actually consumes them depends
+    on the selected DeepSeek model: text-only models will return a 400
+    error if a screenshot is included. Use the
+    ``benchmarks/deepseek_vision_smoke_test.py`` script to probe what
+    the current endpoint accepts.
+    """
+
+    def __init__(
+        self,
+        model_name,
+        api_key=None,
+        temperature=0.5,
+        max_tokens=100,
+        max_retry=4,
+        min_retry_wait_time=60,
+        log_probs=False,
+    ):
+        api_key = api_key or os.getenv("DEEPSEEK_API_KEY")
+        assert api_key, (
+            "DEEPSEEK_API_KEY must be set in the environment when using "
+            "DeepSeekChatModel."
+        )
+        client_args = {
+            "base_url": "https://api.deepseek.com/v1",
+        }
+        super().__init__(
+            model_name=model_name,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retry=max_retry,
+            min_retry_wait_time=min_retry_wait_time,
+            client_class=OpenAI,
+            client_args=client_args,
+            pricing_func=partial(tracking.get_pricing_litellm, model_name=model_name),
+            log_probs=log_probs,
+        )
+
+
+class VertexAIGeminiChatModel(ChatModel):
+    """Chat model for Gemini on Vertex AI via the OpenAI-compatible endpoint.
+
+    Authenticates with Google Cloud Application Default Credentials. Set
+    `GOOGLE_APPLICATION_CREDENTIALS` or run `gcloud auth application-default
+    login`, then set `VERTEXAI_PROJECT` / `GOOGLE_CLOUD_PROJECT` and optionally
+    `VERTEXAI_LOCATION` / `GOOGLE_CLOUD_LOCATION` (defaults to `global`).
+    """
+
+    _AUTH_SCOPES = ("https://www.googleapis.com/auth/cloud-platform",)
+
+    def __init__(
+        self,
+        model_name,
+        project_id=None,
+        location=None,
+        base_url=None,
+        temperature=0.5,
+        max_tokens=100,
+        max_retry=4,
+        min_retry_wait_time=60,
+        log_probs=False,
+    ):
+        self.project_id = (
+            project_id
+            or os.getenv("VERTEXAI_PROJECT")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or os.getenv("GCLOUD_PROJECT")
+            or os.getenv("GCP_PROJECT")
+        )
+        self.location = (
+            location
+            or os.getenv("VERTEXAI_LOCATION")
+            or os.getenv("GOOGLE_CLOUD_LOCATION")
+            or os.getenv("GOOGLE_CLOUD_REGION")
+            or "global"
+        )
+        self._credentials = None
+        self._google_auth_request = None
+
+        api_key = self._get_access_token()
+        client_args = {
+            "base_url": base_url
+            or os.getenv("VERTEXAI_BASE_URL")
+            or self._make_openai_base_url(self.project_id, self.location),
+        }
+        super().__init__(
+            model_name=model_name,
+            api_key=api_key,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            max_retry=max_retry,
+            min_retry_wait_time=min_retry_wait_time,
+            client_class=OpenAI,
+            client_args=client_args,
+            pricing_func=partial(tracking.get_pricing_litellm, model_name=model_name),
+            log_probs=log_probs,
+            completion_token_param="max_tokens",
+        )
+
+    @classmethod
+    def _make_openai_base_url(cls, project_id: str, location: str) -> str:
+        assert project_id, (
+            "Vertex AI Gemini requires a Google Cloud project. Set "
+            "VERTEXAI_PROJECT or GOOGLE_CLOUD_PROJECT, or configure ADC with a "
+            "default project."
+        )
+        if location == "global":
+            host = "aiplatform.googleapis.com"
+        else:
+            host = f"{location}-aiplatform.googleapis.com"
+        return (
+            f"https://{host}/v1/projects/{project_id}/locations/{location}"
+            "/endpoints/openapi"
+        )
+
+    def _get_access_token(self) -> str:
+        try:
+            import google.auth
+            from google.auth.transport.requests import Request as GoogleAuthRequest
+        except ImportError as e:
+            raise ImportError(
+                "google-auth is required for Vertex AI Gemini. Install "
+                "`google-auth` or the repo requirements."
+            ) from e
+
+        try:
+            self._credentials, adc_project_id = google.auth.default(
+                scopes=list(self._AUTH_SCOPES)
+            )
+        except Exception as e:
+            raise RuntimeError(
+                "Vertex AI Gemini requires Google Cloud Application Default "
+                "Credentials. Run `gcloud auth application-default login` or "
+                "set GOOGLE_APPLICATION_CREDENTIALS."
+            ) from e
+
+        self.project_id = self.project_id or adc_project_id
+        self._google_auth_request = GoogleAuthRequest()
+        self._refresh_access_token()
+        return self._credentials.token
+
+    def _refresh_access_token(self) -> None:
+        if self._credentials is None:
+            return
+        expiry = getattr(self._credentials, "expiry", None)
+        refresh_at = None
+        if expiry is not None:
+            if expiry.tzinfo is None:
+                expiry = expiry.replace(tzinfo=timezone.utc)
+            refresh_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+        if not self._credentials.valid or self._credentials.expired or (
+            refresh_at is not None and expiry <= refresh_at
+        ):
+            self._credentials.refresh(self._google_auth_request)
+            self.api_key = self._credentials.token
+            if hasattr(self, "client"):
+                self.client.api_key = self.api_key
+
+    def __call__(self, messages: list[dict], n_samples: int = 1, temperature: float = None) -> dict:
+        self._refresh_access_token()
+        return super().__call__(messages, n_samples=n_samples, temperature=temperature)
 
 
 class AzureChatModel(ChatModel):
@@ -495,11 +769,50 @@ class AnthropicChatModel(AbstractChatModel):
     ):
         self.model_name = model_name
         self.temperature = temperature
-        self.max_tokens = max_tokens
+        self.max_tokens = int(os.getenv("ANTHROPIC_MAX_TOKENS", str(max_tokens)))
         self.max_retry = max_retry
 
         api_key = api_key or os.getenv("ANTHROPIC_API_KEY")
-        self.client = anthropic.Anthropic(api_key=api_key)
+        timeout_seconds = float(os.getenv("ANTHROPIC_TIMEOUT_SECONDS", "300"))
+        self.timeout_seconds = timeout_seconds
+        self.client = anthropic.Anthropic(api_key=api_key, timeout=timeout_seconds)
+
+    @staticmethod
+    def _convert_image_url_content(block: dict) -> dict:
+        image_url = block["image_url"]
+        url = image_url["url"] if isinstance(image_url, dict) else image_url
+
+        if url.startswith("data:image/") and ";base64," in url:
+            media_type, data = url.removeprefix("data:").split(";base64,", 1)
+            return {
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": media_type,
+                    "data": data,
+                },
+            }
+
+        return {
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": url,
+            },
+        }
+
+    @classmethod
+    def _convert_content_to_anthropic(cls, content):
+        if isinstance(content, str):
+            return content
+
+        converted_content = []
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "image_url":
+                converted_content.append(cls._convert_image_url_content(block))
+            else:
+                converted_content.append(block)
+        return converted_content
 
     def __call__(self, messages: list[dict], n_samples: int = 1, temperature: float = None) -> dict:
         # Convert OpenAI format to Anthropic format
@@ -508,9 +821,14 @@ class AnthropicChatModel(AbstractChatModel):
 
         for msg in messages:
             if msg["role"] == "system":
-                system_message = msg["content"]
+                system_message = self._convert_content_to_anthropic(msg["content"])
             else:
-                anthropic_messages.append({"role": msg["role"], "content": msg["content"]})
+                anthropic_messages.append(
+                    {
+                        "role": msg["role"],
+                        "content": self._convert_content_to_anthropic(msg["content"]),
+                    }
+                )
 
         temperature = temperature if temperature is not None else self.temperature
 
@@ -520,13 +838,21 @@ class AnthropicChatModel(AbstractChatModel):
                     "model": self.model_name,
                     "messages": anthropic_messages,
                     "max_tokens": self.max_tokens,
-                    "temperature": temperature,
                 }
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
 
                 if system_message:
                     kwargs["system"] = system_message
 
-                response = self.client.messages.create(**kwargs)
+                # Anthropic's SDK refuses non-streaming requests whose worst-case
+                # runtime (estimated from max_tokens) exceeds 10 minutes. Stream
+                # only for those large generations; browser actions are short and
+                # are more reliable through the normal request path.
+                if self.max_tokens <= 8192:
+                    response = self.client.messages.create(**kwargs)
+                else:
+                    response = self._stream_with_watchdog(kwargs)
 
                 # Track usage if available
                 if hasattr(tracking.TRACKER, "instance"):
@@ -543,6 +869,43 @@ class AnthropicChatModel(AbstractChatModel):
                     raise e
                 logging.warning(f"Anthropic API error (attempt {attempt + 1}): {e}")
                 time.sleep(60)  # Simple retry delay
+
+    def _stream_with_watchdog(self, kwargs):
+        """Run Anthropic streaming with a hard wall-clock timeout.
+
+        The SDK timeout has not always interrupted a wedged streaming response,
+        and Ray may run the task body outside Python's main thread. Run the
+        stream in a daemon thread so the caller can fail/retry on wall-clock
+        timeout even when the SDK call itself is stuck in socket I/O.
+        """
+        if self.timeout_seconds <= 0:
+            with self.client.messages.stream(**kwargs) as stream:
+                for _ in stream.text_stream:
+                    pass
+                return stream.get_final_message()
+
+        result_queue = queue.Queue(maxsize=1)
+
+        def _consume_stream():
+            try:
+                with self.client.messages.stream(**kwargs) as stream:
+                    for _ in stream.text_stream:
+                        pass
+                    result_queue.put((True, stream.get_final_message()))
+            except BaseException as exc:  # noqa: BLE001
+                result_queue.put((False, exc))
+
+        thread = threading.Thread(target=_consume_stream, daemon=True)
+        thread.start()
+        try:
+            ok, result = result_queue.get(timeout=self.timeout_seconds)
+        except queue.Empty as exc:
+            raise TimeoutError(
+                f"Anthropic stream exceeded {self.timeout_seconds:.0f}s"
+            ) from exc
+        if ok:
+            return result
+        raise result
 
 
 @dataclass

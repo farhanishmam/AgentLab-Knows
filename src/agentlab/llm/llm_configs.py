@@ -4,6 +4,8 @@ from agentlab.llm.chat_api import (
     AnthropicModelArgs,
     AzureModelArgs,
     BedrockModelArgs,
+    DeepSeekModelArgs,
+    GoogleModelArgs,
     OpenAIModelArgs,
     OpenRouterModelArgs,
     SelfHostedModelArgs,
@@ -21,6 +23,14 @@ CLOSED_SOURCE_APIS = [
 ]
 
 CHAT_MODEL_ARGS_DICT = {
+    "openai/gpt-5.5-2026-04-23": OpenAIModelArgs(
+        model_name="gpt-5.5-2026-04-23",
+        max_total_tokens=400_000,
+        max_input_tokens=256_000,
+        max_new_tokens=128_000,
+        temperature=1,  # gpt-5.x supports temperature of 1 only
+        vision_support=True,
+    ),
     "openai/gpt-5.4-2026-03-05": OpenAIModelArgs(
         model_name="gpt-5.4-2026-03-05",
         max_total_tokens=400_000,
@@ -208,6 +218,14 @@ CHAT_MODEL_ARGS_DICT = {
         vision_support=True,
     ),
     # ---------------- Anthropic ----------------#
+    "anthropic/claude-opus-4-7": AnthropicModelArgs(
+        model_name="claude-opus-4-7",
+        max_total_tokens=512_000,
+        max_input_tokens=512_000 - 128_000,
+        max_new_tokens=128_000,
+        temperature=None,
+        vision_support=True,
+    ),
     "anthropic/claude-3-7-sonnet-20250219": AnthropicModelArgs(
         model_name="claude-3-7-sonnet-20250219",
         max_new_tokens=16_384,
@@ -258,6 +276,35 @@ CHAT_MODEL_ARGS_DICT = {
         max_new_tokens=2_000,
         backend="huggingface",
         **default_oss_llms_args,
+    ),
+    # ---------------- Google Gemini API ----------------#
+    "google/gemini-3.1-pro-preview": GoogleModelArgs(
+        model_name="gemini-3.1-pro-preview",
+        max_total_tokens=1_048_576,
+        max_input_tokens=1_048_576 - 65_536,
+        max_new_tokens=65_536,
+        temperature=1e-1,
+        vision_support=True,
+    ),
+    # ---------------- DeepSeek (official API) ----------------#
+    # DeepSeek V4 Pro accessed via the OpenAI-compatible endpoint at
+    # ``https://api.deepseek.com/v1``. Authenticates with ``DEEPSEEK_API_KEY``.
+    # Token budgets mirror DeepSeek's published 128k context window with an
+    # 8k cap on completions.
+    #
+    # ``vision_support=True`` lets the harness attach screenshots to the
+    # request. Image blocks are now forwarded as-is by ``DeepSeekChatModel``;
+    # if the upstream model is text-only the request will fail with
+    # ``unknown variant `image_url`, expected `text```. Run
+    # ``benchmarks/deepseek_vision_smoke_test.py`` to verify what the
+    # current endpoint accepts.
+    "deepseek/deepseek-v4-pro": DeepSeekModelArgs(
+        model_name="deepseek-v4-pro",
+        max_total_tokens=128_000,
+        max_input_tokens=128_000 - 8_192,
+        max_new_tokens=8_192,
+        temperature=1e-1,
+        vision_support=True,
     ),
     # ---------------- OPENROUTER ----------------#
     "openrouter/deepseek/deepseek-r1": OpenRouterModelArgs(

@@ -262,8 +262,18 @@ def summarize(sub_df):
 
         _mean_reward, std_reward = get_std_err(sub_df, "cum_reward")
 
-        # sanity check, if there is an error the reward should be zero
-        assert sub_df[sub_df["err_msg"].notnull()]["cum_reward"].sum() == 0
+        # sanity check: errored runs usually have zero reward, but post-hoc
+        # evaluators can score a run that crashed mid-episode, so warn instead
+        # of asserting hard.
+        _err_reward = sub_df[sub_df["err_msg"].notnull()]["cum_reward"].sum()
+        if _err_reward != 0:
+            import warnings
+            warnings.warn(
+                f"summarize_study: {_err_reward} total reward found across "
+                "errored runs (err_msg is not null). This can happen when the "
+                "post-hoc evaluator scores a run that crashed mid-episode.",
+                stacklevel=2,
+            )
 
         record = dict(
             avg_reward=sub_df["cum_reward"].mean(skipna=True).round(3),

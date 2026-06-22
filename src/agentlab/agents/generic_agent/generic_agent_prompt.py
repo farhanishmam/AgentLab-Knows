@@ -11,7 +11,17 @@ from browsergym.core import action
 from browsergym.core.action.base import AbstractActionSet
 
 from agentlab.agents import dynamic_prompting as dp
-from agentlab.llm.llm_utils import HumanMessage, parse_html_tags_raise
+from agentlab.llm.llm_utils import (
+    HumanMessage,
+    defang_tags,
+    parse_html_tags_raise,
+    strip_tag_content,
+)
+
+# All structural tags used in the response format.  Any occurrence of these
+# tags found *inside* a parsed block (e.g. <action> written as an example
+# inside <think>) will be converted to a plain word by defang_tags().
+_STRUCTURAL_TAGS = ["think", "plan", "step", "memory", "action_draft", "criticise", "action"]
 
 
 @dataclass
@@ -124,7 +134,8 @@ class MainPrompt(dp.Shrinkable):
 
 Here is an abstract version of the answer with description of the content of
 each tag. Make sure you follow this structure, but replace the content with your
-answer:
+answer. IMPORTANT: emit each tag at most once and produce only ONE `<action>` for
+the SINGLE next step (never stack multiple `<plan>`/`<step>`/`<action>` blocks):
 {self.think.abstract_ex}\
 {self.plan.abstract_ex}\
 {self.memory.abstract_ex}\
@@ -139,7 +150,9 @@ answer:
 # Concrete Example
 
 Here is a concrete example of how to format your answer.
-Make sure to follow the template with proper tags:
+Make sure to follow the template with proper tags. Each tag below appears
+exactly once; your answer must do the same — do not stack multiple
+`<plan>`/`<step>`/`<action>` blocks together:
 {self.think.concrete_ex}\
 {self.plan.concrete_ex}\
 {self.memory.concrete_ex}\
@@ -155,11 +168,41 @@ Make sure to follow the template with proper tags:
 
     def _parse_answer(self, text_answer):
         ans_dict = {}
-        ans_dict.update(self.think.parse_answer(text_answer))
-        ans_dict.update(self.plan.parse_answer(text_answer))
-        ans_dict.update(self.memory.parse_answer(text_answer))
-        ans_dict.update(self.criticise.parse_answer(text_answer))
-        ans_dict.update(self.action_prompt.parse_answer(text_answer))
+        # Parse each tag using a progressively sanitized copy of the text.
+        # After each parser runs, its tag content is stripped so that tags
+        # written as examples or references inside an already-parsed block
+        # (e.g. an <action> example inside <think> or <plan>) cannot be
+        # accidentally matched by any later parser.
+        #
+        # Additionally, the *extracted content* of every block is defanged:
+        # any structural tag found inside the block (e.g. "<action>" written
+        # as an example inside <think>) is converted to a plain word so it
+        # cannot interfere with later parsing stages.
+        #
+        # When multiple <action> blocks appear in the response, only the last
+        # one is used (handled inside ActionPrompt._parse_answer).
+        text = text_answer
+
+        ans_dict.update(self.think.parse_answer(text))
+        if "think" in ans_dict:
+            ans_dict["think"] = defang_tags(ans_dict["think"], _STRUCTURAL_TAGS)
+        text = strip_tag_content(text, ["think"])
+
+        ans_dict.update(self.plan.parse_answer(text))
+        for key in ("plan", "step"):
+            if key in ans_dict:
+                ans_dict[key] = defang_tags(ans_dict[key], _STRUCTURAL_TAGS)
+        text = strip_tag_content(text, ["plan", "step"])
+
+        ans_dict.update(self.memory.parse_answer(text))
+        if "memory" in ans_dict:
+            ans_dict["memory"] = defang_tags(ans_dict["memory"], _STRUCTURAL_TAGS)
+        text = strip_tag_content(text, ["memory"])
+
+        ans_dict.update(self.criticise.parse_answer(text))
+        text = strip_tag_content(text, ["action_draft", "criticise"])
+
+        ans_dict.update(self.action_prompt.parse_answer(text))
         return ans_dict
 
 
@@ -228,7 +271,14 @@ The plan should be cautious and favor exploring befor submitting.
 """
 
     def _parse_answer(self, text_answer):
-        return parse_html_tags_raise(text_answer, optional_keys=["plan", "step"])
+        # Be lenient: some models occasionally stack several <plan>/<step> blocks
+        # in a single response (one per planned future step). Keep the first
+        # occurrence and warn rather than busting the retry budget.
+        return parse_html_tags_raise(
+            text_answer,
+            optional_keys=["plan", "step"],
+            keep_first_on_multiple=True,
+        )
 
 
 class Criticise(dp.PromptElement):
@@ -258,4 +308,10 @@ explore the page to find a way to activate the form.
 """
 
     def _parse_answer(self, text_answer):
-        return parse_html_tags_raise(text_answer, optional_keys=["action_draft", "criticise"])
+        # Same leniency rationale as ``Plan._parse_answer``: stacked draft/criticise
+        # pairs should not bust the retry budget; keep the first of each.
+        return parse_html_tags_raise(
+            text_answer,
+            optional_keys=["action_draft", "criticise"],
+            keep_first_on_multiple=True,
+        )

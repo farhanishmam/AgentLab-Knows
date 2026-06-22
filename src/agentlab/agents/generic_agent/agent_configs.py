@@ -11,7 +11,7 @@ from agentlab.llm.llm_configs import CHAT_MODEL_ARGS_DICT
 
 from .generic_agent import GenericAgentArgs
 from .generic_agent_prompt import GenericPromptFlags
-from .tmlr_config import BASE_FLAGS
+from .tmlr_config import BASE_FLAGS, SIGN_IN_INSTRUCTIONS
 
 FLAGS_CUSTOM = GenericPromptFlags(
     obs=dp.ObsFlags(
@@ -50,7 +50,7 @@ FLAGS_CUSTOM = GenericPromptFlags(
     enable_chat=False,
     max_prompt_tokens=40_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
 
@@ -98,7 +98,7 @@ FLAGS_GPT_3_5 = GenericPromptFlags(
     enable_chat=False,
     max_prompt_tokens=40_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
 
@@ -145,7 +145,7 @@ FLAGS_LLAMA3_70B = GenericPromptFlags(
     enable_chat=False,
     max_prompt_tokens=40_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
     add_missparsed_messages=True,
 )
 
@@ -195,7 +195,7 @@ FLAGS_8B = GenericPromptFlags(
     enable_chat=False,
     max_prompt_tokens=40_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
     add_missparsed_messages=True,
 )
 
@@ -250,7 +250,7 @@ FLAGS_GPT_4o = GenericPromptFlags(
     enable_chat=False,
     max_prompt_tokens=40_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
 AGENT_4o = GenericAgentArgs(
@@ -395,7 +395,7 @@ AGENT_GPT5_MINI = GenericAgentArgs(
     flags=GPT5_MINI_FLAGS,
 )
 
-FLAGS_GPT54 = GenericPromptFlags(
+FLAGS_GPT55 = GenericPromptFlags(
     obs=dp.ObsFlags(
         use_html=False,
         use_ax_tree=True,
@@ -404,7 +404,7 @@ FLAGS_GPT54 = GenericPromptFlags(
         use_history=True,
         use_past_error_logs=False,
         use_action_history=True,
-        use_think_history=True,
+        use_think_history=False,
         use_diff=False,
         html_type="pruned_html",
         use_screenshot=False,
@@ -430,14 +430,114 @@ FLAGS_GPT54 = GenericPromptFlags(
     use_abstract_example=True,
     use_hints=True,
     enable_chat=False,
-    max_prompt_tokens=40_000,
+    max_prompt_tokens=300_000,
     be_cautious=True,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
-AGENT_GPT54 = GenericAgentArgs(
-    chat_model_args=CHAT_MODEL_ARGS_DICT["openai/gpt-5.4-2026-03-05"],
-    flags=FLAGS_GPT54,
+AGENT_GPT55 = GenericAgentArgs(
+    chat_model_args=CHAT_MODEL_ARGS_DICT["openai/gpt-5.5-2026-04-23"],
+    flags=FLAGS_GPT55,
+)
+
+# Anthropic Claude Opus 4.7 (released Apr 16, 2026). Reuses the same prompt
+# flag set as the frontier GPT-5.5 agent so the comparison is apples-to-apples.
+AGENT_OPUS_47 = GenericAgentArgs(
+    chat_model_args=CHAT_MODEL_ARGS_DICT["anthropic/claude-opus-4-7"],
+    flags=FLAGS_GPT55,
+)
+
+# Google Gemini 3.1 Pro Preview (released Feb 19, 2026), accessed via
+# Gemini's API-key based OpenAI-compatible endpoint.
+AGENT_GEMINI_31_PRO = GenericAgentArgs(
+    chat_model_args=CHAT_MODEL_ARGS_DICT["google/gemini-3.1-pro-preview"],
+    flags=FLAGS_GPT55,
+)
+
+# DeepSeek V4 Pro accessed via DeepSeek's official OpenAI-compatible
+# endpoint (api.deepseek.com). Authenticates with DEEPSEEK_API_KEY.
+AGENT_DEEPSEEK_V4_PRO = GenericAgentArgs(
+    chat_model_args=CHAT_MODEL_ARGS_DICT["deepseek/deepseek-v4-pro"],
+    flags=FLAGS_GPT55,
+)
+
+# ---- Frontier-model observation-mode variants ----------------------------
+# We keep three observation flavours of `FLAGS_GPT55` so the same prompt
+# scaffolding (plan, memory, thinking, 300k token budget) is applied across
+# the three observation modes:
+#   * AXT only            -> accessibility tree, no screenshot.
+#   * Screenshot only     -> screenshot + Set-of-Mark, no axtree.
+#   * Both (axtree+image) -> screenshot + Set-of-Mark + axtree.
+FLAGS_GPT55_AXT = FLAGS_GPT55  # alias of the AXT-only config above
+
+FLAGS_GPT55_SCREENSHOT = FLAGS_GPT55.copy()
+FLAGS_GPT55_SCREENSHOT.obs.use_ax_tree = False
+FLAGS_GPT55_SCREENSHOT.obs.use_screenshot = True
+FLAGS_GPT55_SCREENSHOT.obs.use_som = True
+
+FLAGS_GPT55_BOTH = FLAGS_GPT55.copy()
+FLAGS_GPT55_BOTH.obs.use_ax_tree = True
+FLAGS_GPT55_BOTH.obs.use_screenshot = True
+FLAGS_GPT55_BOTH.obs.use_som = True
+
+
+def _make_frontier_agents(model_key: str, name_prefix: str):
+    """Build (axt, screenshot, both) GenericAgentArgs for one frontier model.
+
+    The agent_name is suffixed with the obs-mode so result directories from
+    the three modes don't clobber each other.
+    """
+    base_kwargs = dict(chat_model_args=CHAT_MODEL_ARGS_DICT[model_key])
+
+    axt = GenericAgentArgs(flags=FLAGS_GPT55_AXT, **base_kwargs)
+    axt.agent_name = f"{name_prefix}_axt"
+
+    screenshot = GenericAgentArgs(flags=FLAGS_GPT55_SCREENSHOT, **base_kwargs)
+    screenshot.agent_name = f"{name_prefix}_screenshot"
+
+    both = GenericAgentArgs(flags=FLAGS_GPT55_BOTH, **base_kwargs)
+    both.agent_name = f"{name_prefix}_axt_screenshot"
+
+    return axt, screenshot, both
+
+
+(
+    AGENT_GPT55_AXT,
+    AGENT_GPT55_SCREENSHOT,
+    AGENT_GPT55_BOTH,
+) = _make_frontier_agents(
+    "openai/gpt-5.5-2026-04-23",
+    name_prefix="GenericAgent-gpt-5.5-2026-04-23",
+)
+
+(
+    AGENT_OPUS_47_AXT,
+    AGENT_OPUS_47_SCREENSHOT,
+    AGENT_OPUS_47_BOTH,
+) = _make_frontier_agents(
+    "anthropic/claude-opus-4-7",
+    name_prefix="GenericAgent-claude-opus-4-7",
+)
+
+(
+    AGENT_GEMINI_31_PRO_AXT,
+    AGENT_GEMINI_31_PRO_SCREENSHOT,
+    AGENT_GEMINI_31_PRO_BOTH,
+) = _make_frontier_agents(
+    "google/gemini-3.1-pro-preview",
+    name_prefix="GenericAgent-gemini-3.1-pro-preview",
+)
+
+# DeepSeek V4 Pro is configured as multimodal, so the screenshot and
+# axt+screenshot variants preserve image observations and send them through
+# the OpenAI-compatible DeepSeek endpoint.
+(
+    AGENT_DEEPSEEK_V4_PRO_AXT,
+    AGENT_DEEPSEEK_V4_PRO_SCREENSHOT,
+    AGENT_DEEPSEEK_V4_PRO_BOTH,
+) = _make_frontier_agents(
+    "deepseek/deepseek-v4-pro",
+    name_prefix="GenericAgent-deepseek-v4-pro",
 )
 
 DEFAULT_RS_FLAGS = GenericPromptFlags(
@@ -479,7 +579,7 @@ DEFAULT_RS_FLAGS = GenericPromptFlags(
     be_cautious=args.Choice([True, False]),
     enable_chat=False,
     max_prompt_tokens=40_000,
-    extra_instructions=None,
+    extra_instructions=SIGN_IN_INSTRUCTIONS,
 )
 
 

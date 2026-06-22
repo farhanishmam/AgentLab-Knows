@@ -18,7 +18,9 @@ from agentlab.llm.llm_utils import (
     ParseError,
     count_tokens,
     extract_code_blocks,
+    extract_html_tags,
     image_to_jpg_base64_url,
+    parse_html_tags,
     parse_html_tags_raise,
 )
 
@@ -488,6 +490,18 @@ Review the current state of the page and all other information to find the best
 possible next action to accomplish your goal. Your answer will be interpreted
 and executed by a program, make sure to follow the formatting instructions.
 
+## Output format rules (read carefully)
+- Decide and emit ONLY the SINGLE next action. Do not pre-execute or stack
+  multiple steps in one response.
+- Each XML-style tag (e.g. `<think>`, `<plan>`, `<step>`, `<memory>`,
+  `<action_draft>`, `<criticise>`, `<action>`) must appear AT MOST ONCE in your
+  answer. Do not repeat or interleave several `<plan>`/`<step>`/`<action>`
+  blocks in the same response.
+- The `<plan>` tag is where you list multiple future steps; reflect that plan
+  via prose inside one `<plan>` block, not by stacking multiple `<plan>` blocks.
+- After you observe the result of your action, you will be called again and
+  can emit the next single action.
+
 ## Goal:
 """,
             )
@@ -523,6 +537,18 @@ and with which only you can interact via specific commands.
 Review the instructions from the user, the current state of the page and all other information
 to find the best possible next action to accomplish your goal. Your answer will be interpreted
 and executed by a program, make sure to follow the formatting instructions.
+
+## Output format rules (read carefully)
+- Decide and emit ONLY the SINGLE next action. Do not pre-execute or stack
+  multiple steps in one response.
+- Each XML-style tag (e.g. `<think>`, `<plan>`, `<step>`, `<memory>`,
+  `<action_draft>`, `<criticise>`, `<action>`) must appear AT MOST ONCE in your
+  answer. Do not repeat or interleave several `<plan>`/`<step>`/`<action>`
+  blocks in the same response.
+- The `<plan>` tag is where you list multiple future steps; reflect that plan
+  via prose inside one `<plan>` block, not by stacking multiple `<plan>` blocks.
+- After you observe the result of your action, you will be called again and
+  can emit the next single action.
 
 ## Chat messages:
 
@@ -608,19 +634,27 @@ elements in the page is through bid which are specified in your observations.
     # """
 
     def _parse_answer(self, text_answer):
-        try:
-            ans_dict = parse_html_tags_raise(text_answer, keys=["action"], merge_multiple=True)
-        except ParseError as e:
+        # Collect every <action> block in the response and pick the last one.
+        # This makes parsing robust to models that first draft an action inside
+        # their reasoning and then emit a final, corrected action at the end.
+        all_actions = extract_html_tags(text_answer, ["action"]).get("action", [])
+
+        if not all_actions:
             if self.action_flags.is_strict:
-                raise e
-            else:
-                # try to extract code blocks
-                blocks = extract_code_blocks(text_answer)
-                if len(blocks) == 0:
-                    raise e
-                else:
-                    code = "\n".join([block for _, block in blocks])
-                    ans_dict = {"action": code, "parse_error": str(e)}
+                raise ParseError("Missing the key <action> in the answer.")
+            # Fallback: try triple-backtick code blocks.
+            blocks = extract_code_blocks(text_answer)
+            if len(blocks) == 0:
+                raise ParseError("Missing the key <action> in the answer.")
+            code = "\n".join([block for _, block in blocks])
+            ans_dict = {"action": code, "parse_error": "Missing the key <action> in the answer."}
+        else:
+            if len(all_actions) > 1:
+                logging.warning(
+                    "Found %d <action> blocks; using the last one.",
+                    len(all_actions),
+                )
+            ans_dict = {"action": all_actions[-1]}
 
         try:
             if ans_dict["action"] == "None":
@@ -628,8 +662,8 @@ elements in the page is through bid which are specified in your observations.
                 # traces missing LLM's response in chat messages.
                 ans_dict["action"] = None
             else:
-                # just check if action can be mapped to python code but keep action as is
-                # the environment will be responsible for mapping it to python
+                # Validate that the action can be mapped to Python code; the
+                # environment is responsible for the actual execution.
                 self.action_set.to_python_code(ans_dict["action"])
         except Exception as e:
             raise ParseError(

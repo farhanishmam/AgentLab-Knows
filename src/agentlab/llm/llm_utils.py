@@ -643,6 +643,49 @@ def extract_html_tags(text, keys):
     return content_dict
 
 
+def strip_tag_content(text, tags):
+    """Erase the inner content of specified HTML tags, leaving only the empty tags.
+
+    Use this to sanitize a response before searching for a specific tag so that
+    occurrences of that tag nested inside other tags (e.g. an ``<action>``
+    example written inside a ``<think>`` block) are not accidentally matched.
+
+    Args:
+        text (str): The input string.
+        tags (list[str]): Tag names whose inner content should be erased.
+
+    Returns:
+        str: The text with the inner content of the specified tags replaced by
+            empty strings, e.g. ``<think>...</think>`` → ``<think></think>``.
+    """
+    for tag in tags:
+        text = re.sub(f"<{tag}>.*?</{tag}>", f"<{tag}></{tag}>", text, flags=re.DOTALL)
+    return text
+
+
+def defang_tags(text, tags):
+    """Convert HTML-like tags to bare tag names by stripping angle brackets.
+
+    Replaces every ``<tag>`` and ``</tag>`` occurrence (for each name in
+    *tags*) with just the tag name as a plain word.  Use this on the
+    *extracted content* of a parsed block so that structural tags written
+    as examples or references inside that block (e.g. ``<action>`` mentioned
+    inside a ``<think>`` section) cannot be confused with real top-level
+    control tags by downstream parsers.
+
+    Args:
+        text (str): Text to sanitize.
+        tags (list[str]): Tag names to defang.
+
+    Returns:
+        str: Sanitized text with angle-bracket tags replaced by their names.
+    """
+    for tag in tags:
+        text = re.sub(rf"</{re.escape(tag)}>", tag, text)
+        text = re.sub(rf"<{re.escape(tag)}>", tag, text)
+    return text
+
+
 class ParseError(Exception):
     pass
 
@@ -654,17 +697,25 @@ def extract_code_blocks(text) -> list[tuple[str, str]]:
     return [(match[0].strip(), match[1].strip()) for match in matches]
 
 
-def parse_html_tags_raise(text, keys=(), optional_keys=(), merge_multiple=False):
+def parse_html_tags_raise(
+    text, keys=(), optional_keys=(), merge_multiple=False, keep_first_on_multiple=False
+):
     """A version of parse_html_tags that raises an exception if the parsing is not successful."""
     content_dict, valid, retry_message = parse_html_tags(
-        text, keys, optional_keys, merge_multiple=merge_multiple
+        text,
+        keys,
+        optional_keys,
+        merge_multiple=merge_multiple,
+        keep_first_on_multiple=keep_first_on_multiple,
     )
     if not valid:
         raise ParseError(retry_message)
     return content_dict
 
 
-def parse_html_tags(text, keys=(), optional_keys=(), merge_multiple=False):
+def parse_html_tags(
+    text, keys=(), optional_keys=(), merge_multiple=False, keep_first_on_multiple=False
+):
     """Satisfy the parse api, extracts 1 match per key and validates that all keys are present
 
     Args:
@@ -672,6 +723,12 @@ def parse_html_tags(text, keys=(), optional_keys=(), merge_multiple=False):
         keys (list[str]): The HTML tags to extract the content from.
         optional_keys (list[str]): The HTML tags to extract the content from, but are optional.
         merge_multiple (bool): Whether to merge multiple instances of the same key.
+        keep_first_on_multiple (bool): If True, when a key appears multiple times,
+            silently keep the first occurrence and emit a warning to the logs instead of
+            marking the parse invalid. Useful when downstream code can only consume a
+            single value (e.g. ``<step>`` should be a scalar) and we want to stay
+            resilient to models that occasionally stack several blocks per response.
+            Takes precedence over ``merge_multiple``.
 
     Returns:
         dict: A dictionary mapping each key to a subset of `text` that match the key.
@@ -691,7 +748,14 @@ def parse_html_tags(text, keys=(), optional_keys=(), merge_multiple=False):
             val = content_dict[key]
             content_dict[key] = val[0]
             if len(val) > 1:
-                if not merge_multiple:
+                if keep_first_on_multiple:
+                    logging.warning(
+                        "Found %d instances of <%s> in answer; keeping the first and "
+                        "ignoring the rest.",
+                        len(val),
+                        key,
+                    )
+                elif not merge_multiple:
                     retry_messages.append(
                         f"Found multiple instances of the key {key}. You should have only one of them."
                     )
